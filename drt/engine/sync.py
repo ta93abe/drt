@@ -57,7 +57,8 @@ def run_sync(
         destination: Destination implementation (REST API, etc.).
         profile: Resolved source credentials.
         project_dir: Root of drt project (for ref() resolution).
-        dry_run: If True, extract but do not call destination.load().
+        dry_run: If True, extract but do not call destination.load() (the
+            destination write state is left untouched as well).
         state_manager: If provided, persist sync result after completion.
 
     Returns:
@@ -81,29 +82,39 @@ def run_sync(
     total_result = SyncResult()
     new_cursor_value: str | None = last_cursor_value
 
-    for record_batch in batch(records_iter, sync.sync.batch_size):
-        # Track max cursor value seen across all batches
-        if cursor_field:
-            for row in record_batch:
-                val = row.get(cursor_field)
-                if val is not None:
-                    str_val = str(val)
-                    if new_cursor_value is None or _cursor_gt(str_val, new_cursor_value):
-                        new_cursor_value = str_val
+    try:
+        for record_batch in batch(records_iter, sync.sync.batch_size):
+            # Track max cursor value seen across all batches
+            if cursor_field:
+                for row in record_batch:
+                    val = row.get(cursor_field)
+                    if val is not None:
+                        str_val = str(val)
+                        if new_cursor_value is None or _cursor_gt(str_val, new_cursor_value):
+                            new_cursor_value = str_val
 
-        if dry_run:
-            total_result.success += len(record_batch)
-            continue
+            if dry_run:
+                total_result.success += len(record_batch)
+                continue
 
-        result = destination.load(record_batch, sync.destination, sync.sync)
-        total_result.success += result.success
-        total_result.failed += result.failed
-        total_result.skipped += result.skipped
-        total_result.errors.extend(result.errors)
-        total_result.row_errors.extend(getattr(result, "row_errors", []))
+            result = destination.load(record_batch, sync.destination, sync.sync)
+            total_result.success += result.success
+            total_result.failed += result.failed
+            total_result.skipped += result.skipped
+            total_result.errors.extend(result.errors)
+            total_result.row_errors.extend(getattr(result, "row_errors", []))
 
-        if sync.sync.on_error == "fail" and result.failed > 0:
-            break
+            if sync.sync.on_error == "fail" and result.failed > 0:
+                break
+    finally:
+        # Destinations that write a whole target keep write state for the
+        # current run. Reset it on every exit path -- success, break, or a
+        # raised exception -- so an instance reused for a later run starts from
+        # an empty state. Destinations without this hook are unaffected.
+        if not dry_run:
+            reset_write_state = getattr(destination, "reset_write_state", None)
+            if callable(reset_write_state):
+                reset_write_state(sync.destination, sync.sync)
 
     if state_manager is not None:
         status = (

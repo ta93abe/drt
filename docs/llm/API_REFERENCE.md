@@ -222,7 +222,7 @@ destination:
   credentials_env: GOOGLE_SA_KEY_PATH      # or: env var pointing to keyfile
 ```
 
-> `overwrite` clears the sheet then writes header + data rows. `append` adds data rows only.
+> `overwrite` clears the sheet once per run, writes the header, then appends further batches. `append` adds data rows only.
 
 ### `type: postgres` (destination)
 

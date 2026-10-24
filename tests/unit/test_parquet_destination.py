@@ -148,3 +148,37 @@ class TestParquetDestinationLoad:
 
         assert result.failed == len(records)
         assert len(result.errors) > 0
+
+
+# ---------------------------------------------------------------------------
+# Multi-batch runs — run_sync() calls load() once per batch on one instance
+# ---------------------------------------------------------------------------
+
+
+class TestParquetDestinationMultiBatch:
+    def test_keeps_every_batch_in_one_file(self, tmp_path: Path) -> None:
+        import pandas as pd
+
+        config = _config(tmp_path)
+        dest = ParquetDestination()
+
+        results = [
+            dest.load([{"id": 1}, {"id": 2}], config, _options()),
+            dest.load([{"id": 3}, {"id": 4}], config, _options()),
+            dest.load([{"id": 5}], config, _options()),
+        ]
+
+        assert list(pd.read_parquet(config.path)["id"]) == [1, 2, 3, 4, 5]
+        assert [result.success for result in results] == [2, 2, 1]
+
+    def test_reset_write_state_starts_a_new_run(self, tmp_path: Path) -> None:
+        import pandas as pd
+
+        config = _config(tmp_path)
+        dest = ParquetDestination()
+        dest.load([{"id": 1}, {"id": 2}], config, _options())
+
+        dest.reset_write_state(config, _options())
+        dest.load([{"id": 3}], config, _options())
+
+        assert list(pd.read_parquet(config.path)["id"]) == [3]

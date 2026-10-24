@@ -46,6 +46,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Snowflake source connector** (#162): Extract data from Snowflake using `snowflake-connector-python`. Supports account, user, password/password_env, database, schema, warehouse, and optional role. Install: `pip install drt-core[snowflake]`.
 - **Dockerfile and docker-compose example** (#161): Lightweight `python:3.12-slim` image with configurable `DRT_EXTRAS` build arg, non-root user, and pinned version. Includes `docker-compose.yml` and `.dockerignore`.
 
+### Fixed
+
+- **Multi-batch file, Parquet and Google Sheets destinations**: A sync with more rows than `sync.batch_size` kept only the last batch in the target while reporting every row as synced. Each destination now writes the first batch of a run and appends the later batches, and `run_sync()` clears that state after every run.
+
 ## [0.4.3] - 2026-04-02
 
 ### Added

@@ -165,3 +165,74 @@ class TestFileDestinationEdgeCases:
 
         assert result.failed == 1
         assert len(result.errors) > 0
+
+
+# ---------------------------------------------------------------------------
+# Multi-batch runs — run_sync() calls load() once per batch on one instance
+# ---------------------------------------------------------------------------
+
+
+class TestFileDestinationMultiBatch:
+    def test_csv_keeps_every_batch_in_one_file(self, tmp_path: Path) -> None:
+        config = _config(tmp_path)
+        dest = FileDestination()
+
+        results = [
+            dest.load([{"id": 1}, {"id": 2}], config, _options()),
+            dest.load([{"id": 3}, {"id": 4}], config, _options()),
+            dest.load([{"id": 5}], config, _options()),
+        ]
+
+        with open(config.path, newline="", encoding="utf-8") as f:
+            rows = list(csv.DictReader(f))
+        assert [row["id"] for row in rows] == ["1", "2", "3", "4", "5"]
+        assert [result.success for result in results] == [2, 2, 1]
+        # The header is written once, not once per batch.
+        with open(config.path, encoding="utf-8") as f:
+            assert f.read().splitlines().count("id") == 1
+
+    def test_json_keeps_every_batch_in_one_array(self, tmp_path: Path) -> None:
+        config = _config(tmp_path, path=str(tmp_path / "output.json"), format="json")
+        dest = FileDestination()
+
+        dest.load([{"id": 1}, {"id": 2}], config, _options())
+        dest.load([{"id": 3}], config, _options())
+
+        with open(config.path, encoding="utf-8") as f:
+            assert json.load(f) == [{"id": 1}, {"id": 2}, {"id": 3}]
+
+    def test_jsonl_keeps_every_batch(self, tmp_path: Path) -> None:
+        config = _config(tmp_path, path=str(tmp_path / "output.jsonl"), format="jsonl")
+        dest = FileDestination()
+
+        dest.load([{"id": 1}, {"id": 2}], config, _options())
+        dest.load([{"id": 3}], config, _options())
+
+        with open(config.path, encoding="utf-8") as f:
+            lines = f.read().splitlines()
+        assert [json.loads(line)["id"] for line in lines] == [1, 2, 3]
+
+    def test_reset_write_state_starts_a_new_run(self, tmp_path: Path) -> None:
+        config = _config(tmp_path)
+        dest = FileDestination()
+        dest.load([{"id": 1}, {"id": 2}], config, _options())
+
+        dest.reset_write_state(config, _options())
+        dest.load([{"id": 3}], config, _options())
+
+        with open(config.path, newline="", encoding="utf-8") as f:
+            rows = list(csv.DictReader(f))
+        assert [row["id"] for row in rows] == ["3"]
+
+    def test_csv_rejects_new_columns_after_the_header(self, tmp_path: Path) -> None:
+        config = _config(tmp_path)
+        dest = FileDestination()
+        dest.load([{"id": 1}], config, _options())
+
+        result = dest.load([{"id": 2, "extra": "x"}], config, _options())
+
+        assert result.failed == 1
+        assert "cannot change" in result.errors[0]
+        with open(config.path, newline="", encoding="utf-8") as f:
+            rows = list(csv.DictReader(f))
+        assert [row["id"] for row in rows] == ["1"]

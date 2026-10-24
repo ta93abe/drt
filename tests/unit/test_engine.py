@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import csv
 from collections.abc import Iterator
 from pathlib import Path
+
+import pytest
 
 from drt.config.credentials import BigQueryProfile, ProfileConfig
 from drt.config.models import DestinationConfig, SyncConfig, SyncOptions
@@ -238,3 +241,88 @@ def test_full_sync_no_cursor_saved(tmp_path: Path) -> None:
     state = state_mgr.get_last_sync("test_sync")
     assert state is not None
     assert state.last_cursor_value is None
+
+
+# ---------------------------------------------------------------------------
+# Destination write state across the batches of one run
+# ---------------------------------------------------------------------------
+
+
+def _file_sync(tmp_path: Path, batch_size: int = 2) -> SyncConfig:
+    return SyncConfig.model_validate(
+        {
+            "name": "to_file",
+            "model": "ref('table')",
+            "destination": {
+                "type": "file",
+                "path": str(tmp_path / "out.csv"),
+                "format": "csv",
+            },
+            "sync": {"batch_size": batch_size},
+        }
+    )
+
+
+def _read_csv(path: Path) -> list[str]:
+    with open(path, newline="", encoding="utf-8") as f:
+        return [row["id"] for row in csv.DictReader(f)]
+
+
+def test_run_sync_writes_every_batch_to_one_file(tmp_path: Path) -> None:
+    from drt.destinations.file import FileDestination
+
+    rows = [{"id": i} for i in range(5)]
+
+    result = run_sync(
+        _file_sync(tmp_path), FakeSource(rows), FileDestination(), _make_profile(), tmp_path
+    )
+
+    assert result.success == 5
+    assert _read_csv(tmp_path / "out.csv") == ["0", "1", "2", "3", "4"]
+
+
+def test_run_sync_resets_destination_write_state_between_runs(tmp_path: Path) -> None:
+    from drt.destinations.file import FileDestination
+
+    dest = FileDestination()
+    sync = _file_sync(tmp_path)
+
+    run_sync(sync, FakeSource([{"id": 0}, {"id": 1}]), dest, _make_profile(), tmp_path)
+    run_sync(sync, FakeSource([{"id": 2}]), dest, _make_profile(), tmp_path)
+
+    # The second run replaces the file instead of appending to the first run.
+    assert _read_csv(tmp_path / "out.csv") == ["2"]
+
+
+def test_run_sync_resets_destination_write_state_after_a_source_error(
+    tmp_path: Path,
+) -> None:
+    class ExplodingSource(FakeSource):
+        def extract(self, query: str, config: ProfileConfig) -> Iterator[dict]:
+            yield {"id": 0}
+            yield {"id": 1}
+            raise RuntimeError("source failed")
+
+    from drt.destinations.file import FileDestination
+
+    dest = FileDestination()
+    sync = _file_sync(tmp_path)
+
+    with pytest.raises(RuntimeError):
+        run_sync(sync, ExplodingSource([]), dest, _make_profile(), tmp_path)
+
+    run_sync(sync, FakeSource([{"id": 2}]), dest, _make_profile(), tmp_path)
+
+    assert _read_csv(tmp_path / "out.csv") == ["2"]
+
+
+def test_run_sync_works_without_a_reset_hook(tmp_path: Path) -> None:
+    # Destinations that write per batch keep no write state, so run_sync must
+    # not require the hook.
+    rows = [{"id": i} for i in range(5)]
+    dest = FakeDestination()
+
+    result = run_sync(_make_sync(batch_size=3), FakeSource(rows), dest, _make_profile(), tmp_path)
+
+    assert result.success == 5
+    assert len(dest.calls) == 2

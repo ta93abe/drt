@@ -46,6 +46,12 @@ def _build_sheets_service(config: GoogleSheetsDestinationConfig) -> Any:
 class GoogleSheetsDestination:
     """Write records to a Google Sheets spreadsheet."""
 
+    def __init__(self) -> None:
+        # Write state for one run of a sync. The engine calls load() once per
+        # batch on this same instance, so the first batch of a run writes the
+        # header and the later batches append their rows to it.
+        self._headers: list[str] | None = None
+
     def load(
         self,
         records: list[dict[str, Any]],
@@ -63,13 +69,26 @@ class GoogleSheetsDestination:
             sheets = service.spreadsheets()
             range_name = config.sheet
 
-            headers = list(records[0].keys())
-            rows = [headers] + [
-                [str(row.get(h, "")) for h in headers] for row in records
-            ]
-            body = {"values": rows}
+            first_batch = self._headers is None
+            headers = (
+                self._headers
+                if self._headers is not None
+                else list(dict.fromkeys(key for record in records for key in record))
+            )
+            unexpected = sorted({key for record in records for key in record} - set(headers))
+            if unexpected:
+                # The rows of an earlier batch of this run are already positioned
+                # under `headers`. A wider row would misalign or drop data, so
+                # fail before the sheet is touched.
+                raise ValueError(
+                    f"Sheet columns cannot change after the header was written for "
+                    f"'{range_name}': expected {headers!r}; unexpected {unexpected!r}"
+                )
+            rows = [[str(row.get(h, "")) for h in headers] for row in records]
 
-            if config.mode == "overwrite":
+            if config.mode == "overwrite" and first_batch:
+                # Clear the sheet once per run, then write the header and the
+                # first batch.
                 sheets.values().clear(
                     spreadsheetId=config.spreadsheet_id,
                     range=range_name,
@@ -79,16 +98,19 @@ class GoogleSheetsDestination:
                     spreadsheetId=config.spreadsheet_id,
                     range=range_name,
                     valueInputOption="RAW",
-                    body=body,
+                    body={"values": [headers, *rows]},
                 ).execute()
             else:
+                # Later batches of a run append their rows under the header that
+                # this run wrote.
                 sheets.values().append(
                     spreadsheetId=config.spreadsheet_id,
                     range=range_name,
                     valueInputOption="RAW",
-                    body={"values": rows[1:]},
+                    body={"values": rows},
                 ).execute()
 
+            self._headers = headers
             result.success = len(records)
 
         except Exception as e:
@@ -96,3 +118,18 @@ class GoogleSheetsDestination:
             result.errors.append(str(e))
 
         return result
+
+    def reset_write_state(
+        self,
+        config: DestinationConfig,
+        sync_options: SyncOptions,
+    ) -> None:
+        """Drop this run's write state.
+
+        `run_sync()` calls this after the batch loop, on every exit path. A
+        library caller that reuses one instance for several `run_sync()` calls
+        must not let the earlier run's header reach the next run's sheet. The
+        call is pure state reset, so it is safe to repeat.
+        """
+        del config, sync_options
+        self._headers = None

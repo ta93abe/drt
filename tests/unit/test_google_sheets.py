@@ -5,6 +5,7 @@ Mocks the Google Sheets API client since there is no local server equivalent.
 
 from __future__ import annotations
 
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 from drt.config.models import GoogleSheetsDestinationConfig, SyncOptions
@@ -112,3 +113,106 @@ class TestGoogleSheetsDestination:
 
         assert result.failed == 1
         assert result.success == 0
+
+
+class TestGoogleSheetsDestinationMultiBatch:
+    """run_sync() calls load() once per batch on one instance."""
+
+    _records = [
+        {"id": 0, "name": "n0"},
+        {"id": 1, "name": "n1"},
+        {"id": 2, "name": "n2"},
+        {"id": 3, "name": "n3"},
+        {"id": 4, "name": "n4"},
+    ]
+
+    def _config(self, mode: str) -> GoogleSheetsDestinationConfig:
+        return GoogleSheetsDestinationConfig(
+            type="google_sheets",
+            spreadsheet_id="test-id",
+            sheet="Sheet1",
+            mode=mode,
+        )
+
+    def _load_batches(
+        self, dest: Any, config: GoogleSheetsDestinationConfig, service: MagicMock
+    ) -> list[Any]:
+        with patch(
+            "drt.destinations.google_sheets._build_sheets_service",
+            return_value=service,
+        ):
+            return [
+                dest.load(self._records[0:2], config, _options()),
+                dest.load(self._records[2:4], config, _options()),
+                dest.load(self._records[4:], config, _options()),
+            ]
+
+    def test_overwrite_clears_once_then_appends_later_batches(self) -> None:
+        from drt.destinations.google_sheets import GoogleSheetsDestination
+
+        service = MagicMock()
+        values = service.spreadsheets.return_value.values.return_value
+        dest = GoogleSheetsDestination()
+
+        results = self._load_batches(dest, self._config("overwrite"), service)
+
+        assert [result.success for result in results] == [2, 2, 1]
+        values.clear.assert_called_once()
+        assert values.update.call_args.kwargs["body"]["values"] == [
+            ["id", "name"],
+            ["0", "n0"],
+            ["1", "n1"],
+        ]
+        appended = [call.kwargs["body"]["values"] for call in values.append.call_args_list]
+        assert appended == [[["2", "n2"], ["3", "n3"]], [["4", "n4"]]]
+
+    def test_append_mode_appends_every_batch(self) -> None:
+        from drt.destinations.google_sheets import GoogleSheetsDestination
+
+        service = MagicMock()
+        values = service.spreadsheets.return_value.values.return_value
+        dest = GoogleSheetsDestination()
+
+        results = self._load_batches(dest, self._config("append"), service)
+
+        assert [result.success for result in results] == [2, 2, 1]
+        values.clear.assert_not_called()
+        assert [call.kwargs["body"]["values"] for call in values.append.call_args_list] == [
+            [["0", "n0"], ["1", "n1"]],
+            [["2", "n2"], ["3", "n3"]],
+            [["4", "n4"]],
+        ]
+
+    def test_reset_write_state_clears_the_sheet_again(self) -> None:
+        from drt.destinations.google_sheets import GoogleSheetsDestination
+
+        service = MagicMock()
+        values = service.spreadsheets.return_value.values.return_value
+        dest = GoogleSheetsDestination()
+        config = self._config("overwrite")
+        self._load_batches(dest, config, service)
+
+        dest.reset_write_state(config, _options())
+        with patch(
+            "drt.destinations.google_sheets._build_sheets_service",
+            return_value=service,
+        ):
+            dest.load(self._records[0:2], config, _options())
+
+        assert values.clear.call_count == 2
+
+    def test_later_batch_cannot_add_columns(self) -> None:
+        from drt.destinations.google_sheets import GoogleSheetsDestination
+
+        service = MagicMock()
+        dest = GoogleSheetsDestination()
+        config = self._config("overwrite")
+        with patch(
+            "drt.destinations.google_sheets._build_sheets_service",
+            return_value=service,
+        ):
+            dest.load([{"id": 0, "name": "n0"}], config, _options())
+            result = dest.load([{"id": 1, "name": "n1", "extra": "x"}], config, _options())
+
+        assert result.failed == 1
+        assert "cannot change" in result.errors[0]
