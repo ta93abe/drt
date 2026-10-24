@@ -164,12 +164,21 @@ def test_run_sync_saves_state(tmp_path: Path) -> None:
 # incremental sync
 # ---------------------------------------------------------------------------
 
-def _make_incremental_sync(cursor_field: str = "updated_at") -> SyncConfig:
+def _make_incremental_sync(
+    cursor_field: str = "updated_at",
+    batch_size: int = 10,
+    on_error: str = "fail",
+) -> SyncConfig:
     return SyncConfig.model_validate({
         "name": "inc_sync",
         "model": "ref('events')",
         "destination": {"type": "rest_api", "url": "https://example.com"},
-        "sync": {"mode": "incremental", "cursor_field": cursor_field, "batch_size": 10},
+        "sync": {
+            "mode": "incremental",
+            "cursor_field": cursor_field,
+            "batch_size": batch_size,
+            "on_error": on_error,
+        },
     })
 
 
@@ -238,3 +247,97 @@ def test_full_sync_no_cursor_saved(tmp_path: Path) -> None:
     state = state_mgr.get_last_sync("test_sync")
     assert state is not None
     assert state.last_cursor_value is None
+
+# ---------------------------------------------------------------------------
+# incremental + dry run / failed batch must not advance the cursor
+# ---------------------------------------------------------------------------
+
+def _seed_state(state_mgr, cursor: str) -> None:
+    from drt.state.manager import SyncState
+
+    state_mgr.save_sync(SyncState(
+        sync_name="inc_sync",
+        last_run_at="2024-01-01T00:00:00",
+        records_synced=5,
+        status="success",
+        last_cursor_value=cursor,
+    ))
+
+
+def test_incremental_dry_run_leaves_cursor_unchanged(tmp_path: Path) -> None:
+    from drt.state.manager import StateManager
+
+    state_mgr = StateManager(tmp_path)
+    _seed_state(state_mgr, "2024-01-01")
+
+    rows = [{"id": 1, "updated_at": "2024-02-01"}]
+    dest = FakeDestination()
+    sync = _make_incremental_sync()
+
+    result = run_sync(
+        sync, FakeSource(rows), dest, _make_profile(), tmp_path,
+        dry_run=True, state_manager=state_mgr,
+    )
+
+    assert result.success == 1
+    assert dest.calls == []
+    state = state_mgr.get_last_sync("inc_sync")
+    assert state is not None
+    assert state.last_cursor_value == "2024-01-01"
+
+
+def test_incremental_dry_run_writes_no_state_on_first_run(tmp_path: Path) -> None:
+    from drt.state.manager import StateManager
+
+    state_mgr = StateManager(tmp_path)
+    rows = [{"id": 1, "updated_at": "2024-02-01"}]
+    sync = _make_incremental_sync()
+
+    run_sync(
+        sync, FakeSource(rows), FakeDestination(), _make_profile(), tmp_path,
+        dry_run=True, state_manager=state_mgr,
+    )
+
+    assert state_mgr.get_last_sync("inc_sync") is None
+
+
+def test_incremental_failed_batch_keeps_previous_cursor(tmp_path: Path) -> None:
+    from drt.state.manager import StateManager
+
+    state_mgr = StateManager(tmp_path)
+    _seed_state(state_mgr, "2024-01-01")
+
+    rows = [
+        {"id": 1, "updated_at": "2024-02-01"},
+        {"id": 2, "updated_at": "2024-02-02"},
+        {"id": 3, "updated_at": "2024-02-03"},
+    ]
+    dest = FakeDestination(fail_indices={0})
+    sync = _make_incremental_sync(on_error="fail")
+
+    run_sync(sync, FakeSource(rows), dest, _make_profile(), tmp_path,
+             state_manager=state_mgr)
+
+    state = state_mgr.get_last_sync("inc_sync")
+    assert state is not None
+    assert state.last_cursor_value == "2024-01-01"
+
+
+def test_incremental_skip_does_not_advance_past_failed_batch(tmp_path: Path) -> None:
+    from drt.state.manager import StateManager
+
+    state_mgr = StateManager(tmp_path)
+    _seed_state(state_mgr, "2024-01-01")
+
+    rows = [{"id": i, "updated_at": "2024-02-0" + str(i)} for i in range(1, 7)]
+    dest = FakeDestination(fail_indices={0})
+    sync = _make_incremental_sync(batch_size=3, on_error="skip")
+
+    run_sync(sync, FakeSource(rows), dest, _make_profile(), tmp_path,
+             state_manager=state_mgr)
+
+    assert len(dest.calls) == 2
+    state = state_mgr.get_last_sync("inc_sync")
+    assert state is not None
+    assert state.last_cursor_value == "2024-01-01"
+

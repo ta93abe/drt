@@ -57,7 +57,8 @@ def run_sync(
         destination: Destination implementation (REST API, etc.).
         profile: Resolved source credentials.
         project_dir: Root of drt project (for ref() resolution).
-        dry_run: If True, extract but do not call destination.load().
+        dry_run: If True, extract but do not call destination.load(),
+            and do not persist sync state.
         state_manager: If provided, persist sync result after completion.
 
     Returns:
@@ -80,17 +81,11 @@ def run_sync(
     records_iter = source.extract(query, profile)
     total_result = SyncResult()
     new_cursor_value: str | None = last_cursor_value
+    # Set once a batch is not fully delivered. The watermark must not move past
+    # records the destination did not accept, so those rows stay in the window.
+    watermark_frozen = False
 
     for record_batch in batch(records_iter, sync.sync.batch_size):
-        # Track max cursor value seen across all batches
-        if cursor_field:
-            for row in record_batch:
-                val = row.get(cursor_field)
-                if val is not None:
-                    str_val = str(val)
-                    if new_cursor_value is None or _cursor_gt(str_val, new_cursor_value):
-                        new_cursor_value = str_val
-
         if dry_run:
             total_result.success += len(record_batch)
             continue
@@ -102,10 +97,22 @@ def run_sync(
         total_result.errors.extend(result.errors)
         total_result.row_errors.extend(getattr(result, "row_errors", []))
 
+        # Advance the watermark only over records the destination accepted.
+        if cursor_field and not watermark_frozen:
+            if result.failed > 0:
+                watermark_frozen = True
+            else:
+                for row in record_batch:
+                    val = row.get(cursor_field)
+                    if val is not None:
+                        str_val = str(val)
+                        if new_cursor_value is None or _cursor_gt(str_val, new_cursor_value):
+                            new_cursor_value = str_val
+
         if sync.sync.on_error == "fail" and result.failed > 0:
             break
 
-    if state_manager is not None:
+    if state_manager is not None and not dry_run:
         status = (
             "success" if total_result.failed == 0
             else "partial" if total_result.success > 0
